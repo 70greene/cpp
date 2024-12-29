@@ -13,12 +13,31 @@ typedef struct zvfs_context_s {
     uint8_t *write_buffer;
     uint8_t *read_buffer;
     uint64_t io_unit_size;
+
+    bool finished;
 } zvfs_context_t;
 
 struct spdk_thread *global_thread = NULL;
 
 static void zvfs_bdev_event_call(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx) {
     SPDK_NOTICELOG("%s --> enter\n", __func__);
+}
+
+static const int POLLER_MAX_TIME = 100000;
+
+static bool poller(struct spdk_thread *thread, spdk_msg_fn start_fn, void *ctx, bool *finished) {
+    spdk_thread_send_msg(thread, start_fn, ctx);
+    int poller_count = 0;
+
+    do {
+        spdk_thread_poll(thread, 0, 0);
+        poller_count++;
+    } while (!(*finished) && poller_count < POLLER_MAX_TIME);
+
+    if (!(*finished) && poller_count >= POLLER_MAX_TIME) {
+        return false;
+    }
+    return true;
 }
 
 static void zvfs_bs_unload_complete(void *arg, int bserrno) {
@@ -45,9 +64,10 @@ static void zvfs_bs_unload(zvfs_context_t *ctx) {
 static void zvfs_blob_read_complete(void *arg, int bserrno) {
     zvfs_context_t *ctx = (zvfs_context_t*)arg;
     SPDK_NOTICELOG("size: %ld, buffer: %s\n", ctx->io_unit_size, ctx->read_buffer);
+    ctx->finished = true;
 }
 
-static void zvfs_blob_write_complete(void *arg, int bserrno) {
+static void zvfs_do_read(void *arg) {
     zvfs_context_t *ctx = (zvfs_context_t*)arg;
     SPDK_NOTICELOG("%s --> enter\n", __func__);
 
@@ -60,9 +80,21 @@ static void zvfs_blob_write_complete(void *arg, int bserrno) {
     spdk_blob_io_read(ctx->blob, ctx->channel, ctx->read_buffer, 0, 1, zvfs_blob_read_complete, ctx);
 }
 
-static void zvfs_blob_sync_complete(void *arg, int bserrno) {
+
+static void zvfs_file_read(zvfs_context_t *ctx) {
+    ctx->finished = false;
+    poller(global_thread, zvfs_do_read, ctx, &ctx->finished);
+}
+
+static void zvfs_blob_write_complete(void *arg, int bserrno) {
     zvfs_context_t *ctx = (zvfs_context_t*)arg;
     SPDK_NOTICELOG("%s --> enter\n", __func__);
+
+    ctx->finished = true;
+}
+
+static void zvfs_do_write(void *arg) {
+    zvfs_context_t *ctx = (zvfs_context_t*)arg;
 
     ctx->write_buffer = spdk_malloc(ctx->io_unit_size, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
     if (ctx->write_buffer == NULL) {
@@ -80,6 +112,19 @@ static void zvfs_blob_sync_complete(void *arg, int bserrno) {
 
     ctx->channel = channel;
     spdk_blob_io_write(ctx->blob, ctx->channel, ctx->write_buffer, 0, 1, zvfs_blob_write_complete, ctx);
+}
+
+static void zvfs_file_write(zvfs_context_t *ctx) {
+    ctx->finished = false;
+    poller(global_thread, zvfs_do_write, ctx, &ctx->finished);
+}
+
+
+static void zvfs_blob_sync_complete(void *arg, int bserrno) {
+    zvfs_context_t *ctx = (zvfs_context_t*)arg;
+
+    ctx->finished = true;
+    SPDK_NOTICELOG("%s --> %lu enter\n", __func__, ctx->io_unit_size);
 }
 
 static void zvfs_blob_resize_complete(void *arg, int bserrno) {
@@ -126,13 +171,36 @@ static void zvfs_entry(void *arg) {
     spdk_bs_init(ctx->bsdev, NULL, zvfs_bs_init_complete, ctx);
 }
 
+static const char *json_file = "/home/mathilda/git/zvfs/hello_blob.json";
+
+static void json_app_load_done(int rc, void *ctx) {
+    bool *done = ctx;
+    *done = true;
+}
+
+static void zvfs_json_load_fn(void *arg) {
+    spdk_subsystem_init_from_json_config(json_file, SPDK_DEFAULT_RPC_ADDR, json_app_load_done, arg, true);
+}
+
 int main(int argc, char *argv[]) {
     printf("hello spdk\n");
 
-    struct spdk_app_opts opts = {};
-    spdk_app_opts_init(&opts, sizeof(struct spdk_app_opts));
-    opts.name = "zvfs";
-    opts.json_config_file = argv[1];
+    struct spdk_env_opts opts;
+    spdk_env_opts_init(&opts);
+    if (spdk_env_init(&opts) != 0) {
+        return -1;
+    }
+       
+    spdk_log_set_print_level(SPDK_LOG_NOTICE);
+    spdk_log_set_level(SPDK_LOG_NOTICE);
+    spdk_log_open(NULL);
+
+    spdk_thread_lib_init(NULL, 0);
+    global_thread = spdk_thread_create("global", NULL);
+    spdk_set_thread(global_thread);
+
+    bool done = false;
+    poller(global_thread, zvfs_json_load_fn, &done, &done);
 
     zvfs_context_t *ctx = calloc(1, sizeof(zvfs_context_t));
     if (ctx == NULL) {
@@ -140,30 +208,30 @@ int main(int argc, char *argv[]) {
     }
     memset(ctx, 0, sizeof(zvfs_context_t));
 
-    int res = spdk_app_start(&opts, zvfs_entry, ctx);
-    if (res) {
-        SPDK_NOTICELOG("ERROR!\n");
-    } else {
-        SPDK_NOTICELOG("SUCCESS!\n");
-    }
+    ctx->finished = false;
+    poller(global_thread, zvfs_entry, ctx, &ctx->finished);
+
+    SPDK_NOTICELOG("--> ctx->io_unit_size: %ld\n", ctx->io_unit_size);
+    
+    zvfs_file_write(ctx);
+    zvfs_file_read(ctx);
+
     return 0;
 }
 
 /*
-mathilda@montclaire:~/git/cpp/zvfs$ sudo ./zvfs hello_blob.json 
+mathilda@montclaire:~/git/cpp/zvfs$ sudo ./zvfs
 [sudo] password for mathilda: 
 hello spdk
-[2024-12-28 16:29:37.937247] Starting SPDK v25.01-pre git sha1 e01cb43b8 / DPDK 24.03.0 initialization...
-[2024-12-28 16:29:37.937326] [ DPDK EAL parameters: zvfs --no-shconf -c 0x1 --huge-unlink --no-telemetry --log-level=lib.eal:6 --log-level=lib.cryptodev:5 --log-level=lib.power:5 --log-level=user1:6 --iova-mode=pa --base-virtaddr=0x200000000000 --match-allocations --file-prefix=spdk_pid784586 ]
-[2024-12-28 16:29:38.063111] app.c: 919:spdk_app_start: *NOTICE*: Total cores available: 1
-[2024-12-28 16:29:38.088073] reactor.c: 995:reactor_run: *NOTICE*: Reactor started on core 0
-[2024-12-28 16:29:38.186407] zvfs.c: 118:zvfs_entry: *NOTICE*: zvfs_entry --> enter
-[2024-12-28 16:29:38.187529] zvfs.c: 112:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
-[2024-12-28 16:29:38.187816] zvfs.c: 103:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
-[2024-12-28 16:29:38.187863] zvfs.c:  95:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
-[2024-12-28 16:29:38.187875] zvfs.c:  87:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
-[2024-12-28 16:29:38.187885] zvfs.c:  65:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> enter
-[2024-12-28 16:29:38.187893] zvfs.c:  52:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
-[2024-12-28 16:29:38.187901] zvfs.c:  47:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-Killed
+[2024-12-28 16:58:14.688265] json_config.c: 659:spdk_subsystem_init_from_json_config: *WARNING*: spdk_subsystem_init_from_json_config: deprecated feature spdk_subsystem_init_from_json_config is deprecated to be removed in v24.09
+[2024-12-28 16:58:14.800163] zvfs.c: 163:zvfs_entry: *NOTICE*: zvfs_entry --> enter
+[2024-12-28 16:58:14.800955] zvfs.c: 157:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
+[2024-12-28 16:58:14.801014] zvfs.c: 148:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
+[2024-12-28 16:58:14.801024] zvfs.c: 140:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
+[2024-12-28 16:58:14.801031] zvfs.c: 132:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
+[2024-12-28 16:58:14.801038] zvfs.c: 127:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> 512 enter
+[2024-12-28 16:58:14.801043] zvfs.c: 214:main: *NOTICE*: --> ctx->io_unit_size: 512
+[2024-12-28 16:58:14.801049] zvfs.c:  91:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
+[2024-12-28 16:58:14.801053] zvfs.c:  72:zvfs_do_read: *NOTICE*: zvfs_do_read --> enter
+[2024-12-28 16:58:14.801058] zvfs.c:  66:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 */
