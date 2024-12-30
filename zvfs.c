@@ -171,26 +171,53 @@ static void zvfs_entry(void *arg) {
     spdk_bs_init(ctx->bsdev, NULL, zvfs_bs_init_complete, ctx);
 }
 
-static const char *json_file = "/home/mathilda/git/zvfs/hello_blob.json";
-
 static void json_app_load_done(int rc, void *ctx) {
     bool *done = ctx;
     *done = true;
 }
 
+void
+json_config_prepare_ctx(spdk_subsystem_init_fn cb_fn, void *cb_arg, bool stop_on_error, void *json,
+			ssize_t json_size, bool initalize_subsystems);
+
+const char* json_str = "{\n"
+"  \"subsystems\": [\n"
+"    {\n"
+"      \"subsystem\": \"bdev\",\n"
+"      \"config\": [\n"
+"        {\n"
+"          \"method\": \"bdev_malloc_create\",\n"
+"          \"params\": {\n"
+"            \"name\": \"Malloc0\",\n"
+"            \"num_blocks\": 32768,\n"
+"            \"block_size\": 512\n"
+"          }\n"
+"        }\n"
+"      ]\n"
+"    }\n"
+"  ]\n"
+"}";
+
 static void zvfs_json_load_fn(void *arg) {
-    spdk_subsystem_init_from_json_config(json_file, SPDK_DEFAULT_RPC_ADDR, json_app_load_done, arg, true);
+    // json_data = spdk_posix_file_load_from_name(json_file, &json_data_size);
+    size_t json_data_size = strlen(json_str) + 1;  // 281
+    void *json_data = malloc(strlen(json_str) + 1);
+    strcpy((char*)json_data, json_str);
+    // printf("JSON data: %s\n", (char*)json_data);
+    json_config_prepare_ctx(json_app_load_done, arg, true, json_data, json_data_size, true);
 }
 
 int main(int argc, char *argv[]) {
     printf("hello spdk\n");
 
     struct spdk_env_opts opts;
+    opts.opts_size = sizeof(opts);
+    opts.name = "zvfs";
     spdk_env_opts_init(&opts);
     if (spdk_env_init(&opts) != 0) {
         return -1;
     }
-       
+
     spdk_log_set_print_level(SPDK_LOG_NOTICE);
     spdk_log_set_level(SPDK_LOG_NOTICE);
     spdk_log_open(NULL);
@@ -220,18 +247,16 @@ int main(int argc, char *argv[]) {
 }
 
 /*
-mathilda@montclaire:~/git/cpp/zvfs$ sudo ./zvfs
-[sudo] password for mathilda: 
+root@nvme:/home/mathilda/git/cpp/zvfs# ./zvfs
 hello spdk
-[2024-12-28 16:58:14.688265] json_config.c: 659:spdk_subsystem_init_from_json_config: *WARNING*: spdk_subsystem_init_from_json_config: deprecated feature spdk_subsystem_init_from_json_config is deprecated to be removed in v24.09
-[2024-12-28 16:58:14.800163] zvfs.c: 163:zvfs_entry: *NOTICE*: zvfs_entry --> enter
-[2024-12-28 16:58:14.800955] zvfs.c: 157:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
-[2024-12-28 16:58:14.801014] zvfs.c: 148:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
-[2024-12-28 16:58:14.801024] zvfs.c: 140:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
-[2024-12-28 16:58:14.801031] zvfs.c: 132:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
-[2024-12-28 16:58:14.801038] zvfs.c: 127:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> 512 enter
-[2024-12-28 16:58:14.801043] zvfs.c: 214:main: *NOTICE*: --> ctx->io_unit_size: 512
-[2024-12-28 16:58:14.801049] zvfs.c:  91:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
-[2024-12-28 16:58:14.801053] zvfs.c:  72:zvfs_do_read: *NOTICE*: zvfs_do_read --> enter
-[2024-12-28 16:58:14.801058] zvfs.c:  66:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+[2024-12-30 14:44:55.449685] zvfs.c: 163:zvfs_entry: *NOTICE*: zvfs_entry --> enter
+[2024-12-30 14:44:55.450462] zvfs.c: 157:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
+[2024-12-30 14:44:55.450517] zvfs.c: 148:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
+[2024-12-30 14:44:55.450533] zvfs.c: 140:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
+[2024-12-30 14:44:55.450547] zvfs.c: 132:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
+[2024-12-30 14:44:55.450563] zvfs.c: 127:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> 512 enter
+[2024-12-30 14:44:55.450572] zvfs.c: 241:main: *NOTICE*: --> ctx->io_unit_size: 512
+[2024-12-30 14:44:55.450583] zvfs.c:  91:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
+[2024-12-30 14:44:55.450593] zvfs.c:  72:zvfs_do_read: *NOTICE*: zvfs_do_read --> enter
+[2024-12-30 14:44:55.450603] zvfs.c:  66:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 */
