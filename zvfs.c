@@ -1,23 +1,31 @@
+#include <dlfcn.h>
 #include <spdk/event.h>
 #include <spdk/blob.h>
 #include <spdk/bdev.h>
 #include <spdk/env.h>
 #include <spdk/blob_bdev.h>
 
-typedef struct zvfs_context_s {
-    struct spdk_bs_dev *bsdev;
-    struct spdk_blob_store *blobstore;
-    struct spdk_blob *blob;
-    struct spdk_io_channel *channel;
+#define FILENAME_LENGTH 128
 
+typedef struct zvfs_file_s {
+    char filename[FILENAME_LENGTH];
     uint8_t *write_buffer;
     uint8_t *read_buffer;
+    struct spdk_blob *blob;
+
+    struct zvfs_filesystem_s *fs;
+} zvfs_file_t;
+
+typedef struct zvfs_filesystem_s {
+    struct spdk_bs_dev *bsdev;
+    struct spdk_blob_store *blobstore;
+    struct spdk_io_channel *channel;
     uint64_t io_unit_size;
-
+    struct spdk_thread *thread;
     bool finished;
-} zvfs_context_t;
+} zvfs_filesystem_t;
 
-struct spdk_thread *global_thread = NULL;
+zvfs_filesystem_t *fs_instance = NULL;
 
 static void zvfs_bdev_event_call(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx) {
     SPDK_NOTICELOG("%s --> enter\n", __func__);
@@ -40,135 +48,169 @@ static bool poller(struct spdk_thread *thread, spdk_msg_fn start_fn, void *ctx, 
     return true;
 }
 
+static void zvfs_file_close(zvfs_file_t *file) {
+    if (file->read_buffer) {
+        spdk_free(file->read_buffer);
+        file->read_buffer = NULL;
+    }
+    if (file->write_buffer) {
+        spdk_free(file->write_buffer);
+        file->write_buffer = NULL;
+    }
+}
+
 static void zvfs_bs_unload_complete(void *arg, int bserrno) {
+    zvfs_filesystem_t *fs = (zvfs_filesystem_t *)arg;
+    fs->finished = true;
     spdk_app_stop(1);
 }
 
-static void zvfs_bs_unload(zvfs_context_t *ctx) {
-    if (ctx->blobstore) {
-        if (ctx->channel) {
-            spdk_bs_free_io_channel(ctx->channel);
+static void zvfs_bs_unload(void *arg) {
+    zvfs_filesystem_t *fs = (zvfs_filesystem_t *)arg;
+    if (fs->blobstore) {
+        if (fs->channel) {
+            spdk_bs_free_io_channel(fs->channel);
         }
-        if (ctx->read_buffer) {
-            spdk_free(ctx->read_buffer);
-            ctx->read_buffer = NULL;
-        }
-        if (ctx->write_buffer) {
-            spdk_free(ctx->write_buffer);
-            ctx->write_buffer = NULL;
-        }
-        spdk_bs_unload(ctx->blobstore, zvfs_bs_unload_complete, ctx);
+
+        spdk_bs_unload(fs->blobstore, zvfs_bs_unload_complete, fs);
     }
+}
+
+static void zvfs_filesystem_unregister(zvfs_filesystem_t *fs) {
+    fs->finished = false;
+    poller(fs->thread, zvfs_bs_unload, fs, &fs->finished);
 }
 
 static void zvfs_blob_read_complete(void *arg, int bserrno) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
-    SPDK_NOTICELOG("size: %ld, buffer: %s\n", ctx->io_unit_size, ctx->read_buffer);
-    ctx->finished = true;
+    zvfs_file_t *file = (zvfs_file_t *)arg;
+    zvfs_filesystem_t *fs = file->fs;
+    SPDK_NOTICELOG("size: %ld, buffer: %s\n", fs->io_unit_size, file->read_buffer);
+    fs->finished = true;
 }
 
 static void zvfs_do_read(void *arg) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
+    zvfs_file_t *file = (zvfs_file_t *)arg;
+    zvfs_filesystem_t *fs = file->fs;
     SPDK_NOTICELOG("%s --> enter\n", __func__);
 
-    ctx->read_buffer = spdk_malloc(ctx->io_unit_size, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-    if (ctx->read_buffer == NULL) {
-        zvfs_bs_unload(ctx);
-        return;
-    }
-    memset(ctx->read_buffer, '\0', ctx->io_unit_size);
-    spdk_blob_io_read(ctx->blob, ctx->channel, ctx->read_buffer, 0, 1, zvfs_blob_read_complete, ctx);
+    memset(file->read_buffer, '\0', fs->io_unit_size);
+    spdk_blob_io_read(file->blob, fs->channel, file->read_buffer, 0, 1, zvfs_blob_read_complete, file);
 }
 
 
-static void zvfs_file_read(zvfs_context_t *ctx) {
-    ctx->finished = false;
-    poller(global_thread, zvfs_do_read, ctx, &ctx->finished);
+static void zvfs_file_read(zvfs_file_t *file) {
+    zvfs_filesystem_t *fs = file->fs;
+    fs->finished = false;
+    poller(fs->thread, zvfs_do_read, file, &fs->finished);
 }
 
 static void zvfs_blob_write_complete(void *arg, int bserrno) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
+    zvfs_file_t *file = (zvfs_file_t *)arg;
+    zvfs_filesystem_t *fs = file->fs;
     SPDK_NOTICELOG("%s --> enter\n", __func__);
 
-    ctx->finished = true;
+    fs->finished = true;
 }
 
 static void zvfs_do_write(void *arg) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
+    zvfs_file_t *file = (zvfs_file_t *)arg;
+    zvfs_filesystem_t *fs = file->fs;
 
-    ctx->write_buffer = spdk_malloc(ctx->io_unit_size, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-    if (ctx->write_buffer == NULL) {
-        zvfs_bs_unload(ctx);
-        return;
-    }
-    memset(ctx->write_buffer, '\0', ctx->io_unit_size);
-    memset(ctx->write_buffer, 'A', ctx->io_unit_size - 1);
+    memset(file->write_buffer, '\0', fs->io_unit_size);
+    memset(file->write_buffer, 'A', fs->io_unit_size - 1);
 
-    struct spdk_io_channel *channel = spdk_bs_alloc_io_channel(ctx->blobstore);
-    if (channel == NULL) {
-        zvfs_bs_unload(ctx);
-        return;
-    }
-
-    ctx->channel = channel;
-    spdk_blob_io_write(ctx->blob, ctx->channel, ctx->write_buffer, 0, 1, zvfs_blob_write_complete, ctx);
+    spdk_blob_io_write(file->blob, fs->channel, file->write_buffer, 0, 1, zvfs_blob_write_complete, file);
 }
 
-static void zvfs_file_write(zvfs_context_t *ctx) {
-    ctx->finished = false;
-    poller(global_thread, zvfs_do_write, ctx, &ctx->finished);
+static void zvfs_file_write(zvfs_file_t *file) {
+    zvfs_filesystem_t *fs = file->fs;
+    fs->finished = false;
+    poller(fs->thread, zvfs_do_write, file, &fs->finished);
 }
-
 
 static void zvfs_blob_sync_complete(void *arg, int bserrno) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
+    zvfs_file_t *file = (zvfs_file_t *)arg;
+    zvfs_filesystem_t *fs = file->fs;
 
-    ctx->finished = true;
-    SPDK_NOTICELOG("%s --> %lu enter\n", __func__, ctx->io_unit_size);
+    fs->finished = true;
+    SPDK_NOTICELOG("%s --> %lu enter\n", __func__, fs->io_unit_size);
 }
 
 static void zvfs_blob_resize_complete(void *arg, int bserrno) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
+    zvfs_file_t *file = (zvfs_file_t *)arg;
     SPDK_NOTICELOG("%s --> enter\n", __func__);
 
-    spdk_blob_sync_md(ctx->blob, zvfs_blob_sync_complete, ctx);
+    spdk_blob_sync_md(file->blob, zvfs_blob_sync_complete, file);
 }
 
 static void zvfs_blob_open_complete(void *arg, struct spdk_blob *blob, int bserrno) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
-    ctx->blob = blob;
+    zvfs_file_t *file = (zvfs_file_t *)arg;
+    zvfs_filesystem_t *fs = file->fs;
+    file->blob = blob;
     SPDK_NOTICELOG("%s --> enter\n", __func__);
 
-    uint64_t freed = spdk_bs_free_cluster_count(ctx->blobstore);
-    spdk_blob_resize(blob, freed, zvfs_blob_resize_complete, ctx);
+    uint64_t freed = spdk_bs_free_cluster_count(fs->blobstore);
+    file->write_buffer = spdk_malloc(fs->io_unit_size, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+    if (file->write_buffer == NULL) {
+        return;
+    }
+
+    file->read_buffer = spdk_malloc(fs->io_unit_size, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+    if (file->read_buffer == NULL) {
+        spdk_free(file->write_buffer);
+        return;
+    }
+
+    spdk_blob_resize(blob, freed, zvfs_blob_resize_complete, file);
 }
 
 static void zvfs_bs_create_complete(void *arg, spdk_blob_id blobid, int bserrno) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
+    zvfs_file_t *file = (zvfs_file_t *)arg;
+    zvfs_filesystem_t *fs = file->fs;
+    
     SPDK_NOTICELOG("%s --> enter\n", __func__);
+    spdk_bs_open_blob(fs->blobstore, blobid, zvfs_blob_open_complete, file);
+}
 
-    spdk_bs_open_blob(ctx->blobstore, blobid, zvfs_blob_open_complete, ctx);
+static void zvfs_do_create(void *arg) {
+    zvfs_file_t *file = (zvfs_file_t *)arg;
+    zvfs_filesystem_t *fs = file->fs;
+    spdk_bs_create_blob(fs->blobstore, zvfs_bs_create_complete, file);
+}
+
+static void zvfs_file_create(zvfs_file_t *file) {
+    zvfs_filesystem_t *fs = file->fs;
+    fs->finished = false;
+
+    poller(fs->thread, zvfs_do_create, file, &fs->finished);
 }
 
 static void zvfs_bs_init_complete(void *arg, struct spdk_blob_store *bs, int bserrno) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
-    ctx->blobstore = bs;
-    ctx->io_unit_size = spdk_bs_get_io_unit_size(bs);
-    SPDK_NOTICELOG("%s --> enter: %lu\n", __func__, ctx->io_unit_size);
-    spdk_bs_create_blob(bs, zvfs_bs_create_complete, ctx);
+    zvfs_filesystem_t *fs = (zvfs_filesystem_t*)arg;
+    fs->blobstore = bs;
+    fs->io_unit_size = spdk_bs_get_io_unit_size(bs);
+    SPDK_NOTICELOG("%s --> enter: %lu\n", __func__, fs->io_unit_size);
+
+    struct spdk_io_channel *channel = spdk_bs_alloc_io_channel(fs->blobstore);
+    if (channel == NULL) {
+        zvfs_bs_unload(fs);
+        return;
+    }
+    fs->channel = channel;
+    fs->finished = true;
 }
 
 static void zvfs_entry(void *arg) {
-    zvfs_context_t *ctx = (zvfs_context_t*)arg;
+    zvfs_filesystem_t *fs = (zvfs_filesystem_t*)arg;
     SPDK_NOTICELOG("%s --> enter\n", __func__);
 
     const char *bdev_name = "Malloc0";
-    int rc = spdk_bdev_create_bs_dev_ext(bdev_name, zvfs_bdev_event_call, NULL, &ctx->bsdev);
+    int rc = spdk_bdev_create_bs_dev_ext(bdev_name, zvfs_bdev_event_call, NULL, &fs->bsdev);
     if (rc != 0) {
         spdk_app_stop(-1);
         return;
     }
-    spdk_bs_init(ctx->bsdev, NULL, zvfs_bs_init_complete, ctx);
+    spdk_bs_init(fs->bsdev, NULL, zvfs_bs_init_complete, fs);
 }
 
 static void json_app_load_done(int rc, void *ctx) {
@@ -207,6 +249,11 @@ static void zvfs_json_load_fn(void *arg) {
     json_config_prepare_ctx(json_app_load_done, arg, true, json_data, json_data_size, true);
 }
 
+#define MAX_FD_COUNT 1024
+#define DEFAULT_FD_NUM 3
+
+zvfs_file_t *files[MAX_FD_COUNT] = {0};
+
 int main(int argc, char *argv[]) {
     printf("hello spdk\n");
 
@@ -217,46 +264,57 @@ int main(int argc, char *argv[]) {
     if (spdk_env_init(&opts) != 0) {
         return -1;
     }
-
+       
     spdk_log_set_print_level(SPDK_LOG_NOTICE);
     spdk_log_set_level(SPDK_LOG_NOTICE);
     spdk_log_open(NULL);
 
+    zvfs_filesystem_t *fs = calloc(1, sizeof(zvfs_filesystem_t));
+    if (!fs) {
+        return 0;
+    }
+
     spdk_thread_lib_init(NULL, 0);
-    global_thread = spdk_thread_create("global", NULL);
-    spdk_set_thread(global_thread);
+    fs->thread = spdk_thread_create("global", NULL);
+    spdk_set_thread(fs->thread);
 
     bool done = false;
-    poller(global_thread, zvfs_json_load_fn, &done, &done);
+    poller(fs->thread, zvfs_json_load_fn, &done, &done);
 
-    zvfs_context_t *ctx = calloc(1, sizeof(zvfs_context_t));
-    if (ctx == NULL) {
-        return -1;
+    fs->finished = false;
+    poller(fs->thread, zvfs_entry, fs, &fs->finished);
+
+    zvfs_file_t *file = calloc(1, sizeof(zvfs_file_t));
+    if (!file) {
+        free(fs);
+        return 0;
     }
-    memset(ctx, 0, sizeof(zvfs_context_t));
+    SPDK_NOTICELOG("zvfs_file_create\n");
+    file->fs = fs;
+    zvfs_file_create(file);
 
-    ctx->finished = false;
-    poller(global_thread, zvfs_entry, ctx, &ctx->finished);
+    zvfs_file_write(file);
+    zvfs_file_read(file);
+    zvfs_file_close(file);
 
-    SPDK_NOTICELOG("--> ctx->io_unit_size: %ld\n", ctx->io_unit_size);
-    
-    zvfs_file_write(ctx);
-    zvfs_file_read(ctx);
+    zvfs_filesystem_unregister(fs);
 
     return 0;
 }
 
 /*
-root@nvme:/home/mathilda/git/cpp/zvfs# ./zvfs
+root@nvme:/home/mathilda/git/cpp/zvfs# ./zvfs 
 hello spdk
-[2024-12-30 14:44:55.449685] zvfs.c: 163:zvfs_entry: *NOTICE*: zvfs_entry --> enter
-[2024-12-30 14:44:55.450462] zvfs.c: 157:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
-[2024-12-30 14:44:55.450517] zvfs.c: 148:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
-[2024-12-30 14:44:55.450533] zvfs.c: 140:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
-[2024-12-30 14:44:55.450547] zvfs.c: 132:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
-[2024-12-30 14:44:55.450563] zvfs.c: 127:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> 512 enter
-[2024-12-30 14:44:55.450572] zvfs.c: 241:main: *NOTICE*: --> ctx->io_unit_size: 512
-[2024-12-30 14:44:55.450583] zvfs.c:  91:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
-[2024-12-30 14:44:55.450593] zvfs.c:  72:zvfs_do_read: *NOTICE*: zvfs_do_read --> enter
-[2024-12-30 14:44:55.450603] zvfs.c:  66:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+[2024-12-30 15:15:58.671657] zvfs.c: 205:zvfs_entry: *NOTICE*: zvfs_entry --> enter
+[2024-12-30 15:15:58.672505] zvfs.c: 192:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
+[2024-12-30 15:15:58.672529] zvfs.c: 292:main: *NOTICE*: zvfs_file_create
+[2024-12-30 15:15:58.672543] zvfs.c: 171:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
+[2024-12-30 15:15:58.672553] zvfs.c: 150:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
+[2024-12-30 15:15:58.672563] zvfs.c: 141:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
+[2024-12-30 15:15:58.672573] zvfs.c: 136:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> 512 enter
+[2024-12-30 15:15:58.672579] zvfs.c: 110:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
+[2024-12-30 15:15:58.672584] zvfs.c:  94:zvfs_do_read: *NOTICE*: zvfs_do_read --> enter
+[2024-12-30 15:15:58.672590] zvfs.c:  87:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+[2024-12-30 15:15:58.672598] blobstore.c:5929:spdk_bs_unload: *ERROR*: Blobstore still has open blobs
+[2024-12-30 15:15:58.672603] app.c:1064:spdk_app_stop: *WARNING*: spdk_app_stop'd on non-zero
 */
