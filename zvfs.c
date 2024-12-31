@@ -411,34 +411,3 @@ int close(int fd) {
     dblog("close ...\n");
     return zvfs_close(fd);
 }
-
-int main(int argc, char *argv[]) {
-    printf("hello spdk\n");
-
-    int fd = open("a.txt", O_RDWR | O_CREAT);
-    char *wbuffer = "450 mathilda";
-
-    write(fd, wbuffer, strlen(wbuffer));
-
-    char rbuffer[1024] = {0};
-    read(fd, rbuffer, 1024);
-    printf("rbuffer: %s\n", rbuffer);
-
-    close(fd);
-    return 0;
-}
-
-/*
-root@nvme:/home/mathilda/git/cpp/zvfs# ./zvfs
-hello spdk
-open a.txt ...
-read ...
-close ...
-EAL: Unable to read from VFIO noiommu file 0 (Success)
-read ...
-close ...
-EAL: FATAL: Cannot use IOVA as 'PA' since physical addresses are not available
-EAL: Cannot use IOVA as 'PA' since physical addresses are not available
-[2024-12-30 17:13:52.361324] init.c: 733:spdk_env_init: *ERROR*: Failed to initialize DPDK
-Segmentation fault (core dumped)
-*/

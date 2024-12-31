@@ -1,0 +1,11 @@
+{
+	global:
+
+	# public functions
+	open;
+	read;
+	write;
+	close;
+
+	local: *;
+};
