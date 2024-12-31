@@ -360,37 +360,85 @@ static int zvfs_close(int fd) {
     return 0;
 }
 
+#define DEBUG_ENABLE 1
+
+#if DEBUG_ENABLE
+#define dblog(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#else
+#define dblog(fmt, ...)
+#endif
+
+typedef int (*open_t)(const char *pathname, int flags);
+open_t open_f = NULL;
+
+typedef int (*read_t)(int fd, void *buf, size_t conut);
+read_t read_f = NULL;
+
+typedef ssize_t (*write_t)(int fd, const void *buf, size_t count);
+write_t write_f = NULL;
+
+typedef int (*close_t)(int fd);
+close_t close_f = NULL;
+
+int open(const char *pathname, int flags, ...) {
+    if (!open_f) {
+        open_f = dlsym(RTLD_NEXT, "open");
+    }
+    dblog("open %s ...\n", pathname);
+    return zvfs_create(pathname, flags);
+}
+
+ssize_t read(int fd, void *buf, size_t count) {
+    if (!read_f) {
+        read_f = dlsym(RTLD_NEXT, "read");
+    }
+    dblog("read ...\n");
+    return zvfs_read(fd, buf, count);
+}
+
+ssize_t write(int fd, const void *buf, size_t count) {
+    if (!write_f) {
+        write_f = dlsym(RTLD_NEXT, "write");
+    }
+    dblog("write ...\n");
+    return zvfs_write(fd, buf, count);
+}
+
+int close(int fd) {
+    if (!close_f) {
+        close_f  = dlsym(RTLD_NEXT, "close");
+    }
+    dblog("close ...\n");
+    return zvfs_close(fd);
+}
+
 int main(int argc, char *argv[]) {
     printf("hello spdk\n");
 
-    int fd = zvfs_create("a.txt", O_RDWR | O_CREAT);
+    int fd = open("a.txt", O_RDWR | O_CREAT);
     char *wbuffer = "450 mathilda";
 
-    zvfs_write(fd, wbuffer, strlen(wbuffer));
+    write(fd, wbuffer, strlen(wbuffer));
 
     char rbuffer[1024] = {0};
-    zvfs_read(fd, rbuffer, 1024);
+    read(fd, rbuffer, 1024);
     printf("rbuffer: %s\n", rbuffer);
 
-    zvfs_close(fd);
-
+    close(fd);
     return 0;
 }
 
 /*
 root@nvme:/home/mathilda/git/cpp/zvfs# ./zvfs
 hello spdk
-[2024-12-30 17:04:25.117424] zvfs.c: 205:zvfs_entry: *NOTICE*: zvfs_entry --> enter
-[2024-12-30 17:04:25.118345] zvfs.c: 192:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
-[2024-12-30 17:04:25.118390] zvfs.c: 171:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
-[2024-12-30 17:04:25.118405] zvfs.c: 150:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
-[2024-12-30 17:04:25.118463] zvfs.c: 141:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
-[2024-12-30 17:04:25.118484] zvfs.c: 136:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> 512 enter
-[2024-12-30 17:04:25.118499] zvfs.c: 110:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
-[2024-12-30 17:04:25.118529] zvfs.c:  94:zvfs_do_read: *NOTICE*: zvfs_do_read --> enter
-[2024-12-30 17:04:25.118544] zvfs.c:  87:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: 450 mathilda
-rbuffer: 450 mathilda
-[2024-12-30 17:04:25.118563] blobstore.c:5929:spdk_bs_unload: *ERROR*: Blobstore still has open blobs
-[2024-12-30 17:04:25.118575] app.c:1064:spdk_app_stop: *WARNING*: spdk_app_stop'd on non-zero
+open a.txt ...
+read ...
+close ...
+EAL: Unable to read from VFIO noiommu file 0 (Success)
+read ...
+close ...
+EAL: FATAL: Cannot use IOVA as 'PA' since physical addresses are not available
+EAL: Cannot use IOVA as 'PA' since physical addresses are not available
+[2024-12-30 17:13:52.361324] init.c: 733:spdk_env_init: *ERROR*: Failed to initialize DPDK
+Segmentation fault (core dumped)
 */
-
