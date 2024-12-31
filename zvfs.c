@@ -71,7 +71,7 @@ static void zvfs_bs_unload(void *arg) {
         if (fs->channel) {
             spdk_bs_free_io_channel(fs->channel);
         }
-
+        // FIXME: should clean blob
         spdk_bs_unload(fs->blobstore, zvfs_bs_unload_complete, fs);
     }
 }
@@ -116,8 +116,8 @@ static void zvfs_do_write(void *arg) {
     zvfs_file_t *file = (zvfs_file_t *)arg;
     zvfs_filesystem_t *fs = file->fs;
 
-    memset(file->write_buffer, '\0', fs->io_unit_size);
-    memset(file->write_buffer, 'A', fs->io_unit_size - 1);
+    // memset(file->write_buffer, '\0', fs->io_unit_size);
+    // memset(file->write_buffer, 'A', fs->io_unit_size - 1);
 
     spdk_blob_io_write(file->blob, fs->channel, file->write_buffer, 0, 1, zvfs_blob_write_complete, file);
 }
@@ -253,18 +253,33 @@ static void zvfs_json_load_fn(void *arg) {
 #define DEFAULT_FD_NUM 3
 
 zvfs_file_t *files[MAX_FD_COUNT] = {0};
+static unsigned fd_table[MAX_FD_COUNT / 8] = {0};
 
-int main(int argc, char *argv[]) {
-    printf("hello spdk\n");
+static int zvfs_get_fd(void) {
+    int fd = DEFAULT_FD_NUM;
+    for (; fd < MAX_FD_COUNT; fd++) {
+        if ((fd_table[fd / 8] & (0x1 << (fd % 8))) == 0) {
+            fd_table[fd / 8] = (0x1 << (fd % 8));
+            return fd;
+        }
+    }
+    return -1;
+}
 
+static void zvfs_set_fd(int fd) {
+    if (fd >= MAX_FD_COUNT) {
+        return;
+    }
+    fd_table[fd / 8] &= ~(0x1 << (fd % 8));
+}
+
+static int zvfs_filesystem_setup(void) {
     struct spdk_env_opts opts;
-    opts.opts_size = sizeof(opts);
-    opts.name = "zvfs";
     spdk_env_opts_init(&opts);
     if (spdk_env_init(&opts) != 0) {
         return -1;
     }
-       
+
     spdk_log_set_print_level(SPDK_LOG_NOTICE);
     spdk_log_set_level(SPDK_LOG_NOTICE);
     spdk_log_open(NULL);
@@ -273,6 +288,7 @@ int main(int argc, char *argv[]) {
     if (!fs) {
         return 0;
     }
+    fs_instance = fs;
 
     spdk_thread_lib_init(NULL, 0);
     fs->thread = spdk_thread_create("global", NULL);
@@ -284,37 +300,97 @@ int main(int argc, char *argv[]) {
     fs->finished = false;
     poller(fs->thread, zvfs_entry, fs, &fs->finished);
 
+    return 0;
+}
+
+static int zvfs_create(const char *pathname, int flags) {
+    if (!fs_instance) {
+        zvfs_filesystem_setup();
+    }
+
+    int fd = zvfs_get_fd();
     zvfs_file_t *file = calloc(1, sizeof(zvfs_file_t));
     if (!file) {
-        free(fs);
+        return -1;
+    }
+
+    strcpy(file->filename, pathname);
+    files[fd] = file;
+    file->fs = fs_instance;
+    zvfs_file_create(file);
+    return fd;
+}
+
+static ssize_t zvfs_write(int fd, const void *buf, size_t count) {
+    zvfs_file_t *file = files[fd];
+    if (!file) {
+        return -1;
+    }
+
+    memcpy(file->write_buffer, buf, count);
+    zvfs_file_write(file);
+    return 0;
+}
+
+static ssize_t zvfs_read(int fd, void *buf, size_t count) {
+    zvfs_file_t *file = files[fd];
+    if (!file) {
+        return -1;
+    }
+
+    zvfs_file_read(file);
+    memcpy(buf, file->read_buffer, count);
+    return 0;
+}
+
+static int zvfs_close(int fd) {
+    zvfs_file_t *file = files[fd];
+    if (!file) {
         return 0;
     }
-    SPDK_NOTICELOG("zvfs_file_create\n");
-    file->fs = fs;
-    zvfs_file_create(file);
 
-    zvfs_file_write(file);
-    zvfs_file_read(file);
+    zvfs_filesystem_unregister(file->fs);
+
     zvfs_file_close(file);
+    zvfs_set_fd(fd);
 
-    zvfs_filesystem_unregister(fs);
+    free(file);
+    files[fd] = NULL;
+
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    printf("hello spdk\n");
+
+    int fd = zvfs_create("a.txt", O_RDWR | O_CREAT);
+    char *wbuffer = "450 mathilda";
+
+    zvfs_write(fd, wbuffer, strlen(wbuffer));
+
+    char rbuffer[1024] = {0};
+    zvfs_read(fd, rbuffer, 1024);
+    printf("rbuffer: %s\n", rbuffer);
+
+    zvfs_close(fd);
 
     return 0;
 }
 
 /*
-root@nvme:/home/mathilda/git/cpp/zvfs# ./zvfs 
+root@nvme:/home/mathilda/git/cpp/zvfs# ./zvfs
 hello spdk
-[2024-12-30 15:15:58.671657] zvfs.c: 205:zvfs_entry: *NOTICE*: zvfs_entry --> enter
-[2024-12-30 15:15:58.672505] zvfs.c: 192:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
-[2024-12-30 15:15:58.672529] zvfs.c: 292:main: *NOTICE*: zvfs_file_create
-[2024-12-30 15:15:58.672543] zvfs.c: 171:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
-[2024-12-30 15:15:58.672553] zvfs.c: 150:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
-[2024-12-30 15:15:58.672563] zvfs.c: 141:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
-[2024-12-30 15:15:58.672573] zvfs.c: 136:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> 512 enter
-[2024-12-30 15:15:58.672579] zvfs.c: 110:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
-[2024-12-30 15:15:58.672584] zvfs.c:  94:zvfs_do_read: *NOTICE*: zvfs_do_read --> enter
-[2024-12-30 15:15:58.672590] zvfs.c:  87:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-[2024-12-30 15:15:58.672598] blobstore.c:5929:spdk_bs_unload: *ERROR*: Blobstore still has open blobs
-[2024-12-30 15:15:58.672603] app.c:1064:spdk_app_stop: *WARNING*: spdk_app_stop'd on non-zero
+[2024-12-30 17:04:25.117424] zvfs.c: 205:zvfs_entry: *NOTICE*: zvfs_entry --> enter
+[2024-12-30 17:04:25.118345] zvfs.c: 192:zvfs_bs_init_complete: *NOTICE*: zvfs_bs_init_complete --> enter: 512
+[2024-12-30 17:04:25.118390] zvfs.c: 171:zvfs_bs_create_complete: *NOTICE*: zvfs_bs_create_complete --> enter
+[2024-12-30 17:04:25.118405] zvfs.c: 150:zvfs_blob_open_complete: *NOTICE*: zvfs_blob_open_complete --> enter
+[2024-12-30 17:04:25.118463] zvfs.c: 141:zvfs_blob_resize_complete: *NOTICE*: zvfs_blob_resize_complete --> enter
+[2024-12-30 17:04:25.118484] zvfs.c: 136:zvfs_blob_sync_complete: *NOTICE*: zvfs_blob_sync_complete --> 512 enter
+[2024-12-30 17:04:25.118499] zvfs.c: 110:zvfs_blob_write_complete: *NOTICE*: zvfs_blob_write_complete --> enter
+[2024-12-30 17:04:25.118529] zvfs.c:  94:zvfs_do_read: *NOTICE*: zvfs_do_read --> enter
+[2024-12-30 17:04:25.118544] zvfs.c:  87:zvfs_blob_read_complete: *NOTICE*: size: 512, buffer: 450 mathilda
+rbuffer: 450 mathilda
+[2024-12-30 17:04:25.118563] blobstore.c:5929:spdk_bs_unload: *ERROR*: Blobstore still has open blobs
+[2024-12-30 17:04:25.118575] app.c:1064:spdk_app_stop: *WARNING*: spdk_app_stop'd on non-zero
 */
+
